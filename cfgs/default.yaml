@@ -1,7 +1,7 @@
 # environment
 task: quadruped-run
 modality: 'state'
-action_repeat: ???
+action_repeat: 4
 discount: 0.99
 episode_length: 1000/${action_repeat}
 train_steps: 500000/${action_repeat}
@@ -34,20 +34,30 @@ seed_steps: 5000
 update_freq: 2
 tau: 0.01
 
+# C-mixup hyperparameters
+use_cmixup: true
+cmixup_alpha: 0.4
+cmixup_pairs: 2
+
+# C-mixup coefficients for different loss components
+cmixup_consistency_coef: 1.0
+cmixup_reward_coef: 0.5
+cmixup_value_coef: 0.2
+
 # architecture
 enc_dim: 256
 mlp_dim: 512
 latent_dim: 50
 
 # wandb (insert your own)
-use_wandb: false
-wandb_project: none
-wandb_entity: none
+use_wandb: true
+wandb_project: MBRL
+wandb_entity: arshv27
 
 # misc
 seed: 1
 exp_name: default
 eval_freq: 20000
 eval_episodes: 10
-save_video: false
-save_model: false
+save_video: true
+save_model: true

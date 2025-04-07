@@ -175,6 +175,81 @@ class TDMPC():
 		td_target = reward + self.cfg.discount * \
 			torch.min(*self.model_target.Q(next_z, self.model.pi(next_z, self.cfg.min_std)))
 		return td_target
+	
+	def _generate_mixup_data(self, batch_size):
+		"""Generate interpolation coefficients for C-mixup."""
+		if not hasattr(self.cfg, 'use_cmixup') or not self.cfg.use_cmixup:
+			return None, None
+			
+		# Sample beta distribution for interpolation coefficients
+		lam = torch.from_numpy(np.random.beta(
+			self.cfg.cmixup_alpha, self.cfg.cmixup_alpha, size=(batch_size, 1)
+		)).float().to(self.device)
+		
+		# Create random permutation indices for mixing
+		perm = torch.randperm(batch_size)
+		
+		return lam, perm
+	
+	def _apply_cmixup_consistency(self, z, next_z, action, lam, perm, next_z_pred):
+		"""Apply C-mixup to consistency loss."""
+		if lam is None or next_z_pred is None:
+			return None
+		
+		# Interpolate states (z) and actions
+		z_mix = lam * z + (1 - lam) * z[perm]
+		action_mix = lam * action + (1 - lam) * action[perm]
+		
+		# Predict next states using mixed inputs
+		next_z_mix, _ = self.model.next(z_mix, action_mix)
+		
+		# Compute target for mixed prediction (interpolate between individual predictions)
+		next_z_target = lam * next_z_pred + (1 - lam) * next_z_pred[perm]
+		
+		# Compute consistency loss for C-mixup
+		cmixup_loss = torch.mean(h.mse(next_z_mix, next_z_target), dim=1, keepdim=True)
+		
+		return cmixup_loss
+	
+	def _apply_cmixup_reward(self, z, action, reward, lam, perm):
+		"""Apply C-mixup to reward prediction loss."""
+		if lam is None:
+			return None
+		
+		# Interpolate states (z) and actions
+		z_mix = lam * z + (1 - lam) * z[perm]
+		action_mix = lam * action + (1 - lam) * action[perm]
+		
+		# Predict reward using mixed inputs
+		_, reward_mix = self.model.next(z_mix, action_mix)
+		
+		# Compute target for mixed prediction (interpolate between individual rewards)
+		reward_target = lam * reward + (1 - lam) * reward[perm]
+		
+		# Compute reward prediction loss for C-mixup
+		cmixup_loss = h.mse(reward_mix, reward_target)
+		
+		return cmixup_loss
+	
+	def _apply_cmixup_value(self, z, action, td_target, lam, perm):
+		"""Apply C-mixup to value prediction loss."""
+		if lam is None:
+			return None
+		
+		# Interpolate states (z) and actions
+		z_mix = lam * z + (1 - lam) * z[perm]
+		action_mix = lam * action + (1 - lam) * action[perm]
+		
+		# Predict Q-values using mixed inputs
+		Q1_mix, Q2_mix = self.model.Q(z_mix, action_mix)
+		
+		# Compute target for mixed prediction (interpolate between individual targets)
+		td_target_mix = lam * td_target + (1 - lam) * td_target[perm]
+		
+		# Compute value prediction loss for C-mixup
+		cmixup_loss = h.mse(Q1_mix, td_target_mix) + h.mse(Q2_mix, td_target_mix)
+		
+		return cmixup_loss
 
 	def update(self, replay_buffer, step):
 		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
@@ -188,28 +263,75 @@ class TDMPC():
 		zs = [z.detach()]
 
 		consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0
+		cmixup_consistency_loss, cmixup_reward_loss, cmixup_value_loss = 0, 0, 0
+		
+		batch_size = obs.shape[0]
+		num_pairs = self.cfg.cmixup_pairs if hasattr(self.cfg, 'cmixup_pairs') else 2
+		
 		for t in range(self.cfg.horizon):
-
 			# Predictions
 			Q1, Q2 = self.model.Q(z, action[t])
-			z, reward_pred = self.model.next(z, action[t])
+			next_z_pred, reward_pred = self.model.next(z, action[t])
+			
 			with torch.no_grad():
 				next_obs = self.aug(next_obses[t])
 				next_z = self.model_target.h(next_obs)
 				td_target = self._td_target(next_obs, reward[t])
+			
+			# Apply C-mixup for each pair of samples
+			if hasattr(self.cfg, 'use_cmixup') and self.cfg.use_cmixup:
+				for _ in range(num_pairs):
+					lam, perm = self._generate_mixup_data(batch_size)
+					
+					# Apply C-mixup to each loss component independently
+					if hasattr(self.cfg, 'cmixup_consistency_coef') and self.cfg.cmixup_consistency_coef > 0:
+						cons_loss = self._apply_cmixup_consistency(z, next_z, action[t], lam, perm, next_z_pred)
+						if cons_loss is not None:
+							cmixup_consistency_loss += cons_loss
+					
+					if hasattr(self.cfg, 'cmixup_reward_coef') and self.cfg.cmixup_reward_coef > 0:
+						rew_loss = self._apply_cmixup_reward(z, action[t], reward[t], lam, perm)
+						if rew_loss is not None:
+							cmixup_reward_loss += rew_loss
+					
+					if hasattr(self.cfg, 'cmixup_value_coef') and self.cfg.cmixup_value_coef > 0:
+						val_loss = self._apply_cmixup_value(z, action[t], td_target, lam, perm)
+						if val_loss is not None:
+							cmixup_value_loss += val_loss
+			
+			# Update latent state
+			z = next_z_pred
 			zs.append(z.detach())
 
-			# Losses
+			# Regular losses
 			rho = (self.cfg.rho ** t)
 			consistency_loss += rho * torch.mean(h.mse(z, next_z), dim=1, keepdim=True)
 			reward_loss += rho * h.mse(reward_pred, reward[t])
 			value_loss += rho * (h.mse(Q1, td_target) + h.mse(Q2, td_target))
 			priority_loss += rho * (h.l1(Q1, td_target) + h.l1(Q2, td_target))
 
-		# Optimize model
+		# Normalize C-mixup losses by the number of pairs
+		if num_pairs > 0:
+			cmixup_consistency_loss /= num_pairs
+			cmixup_reward_loss /= num_pairs
+			cmixup_value_loss /= num_pairs
+
+		# Optimize model with all loss components
 		total_loss = self.cfg.consistency_coef * consistency_loss.clamp(max=1e4) + \
 					 self.cfg.reward_coef * reward_loss.clamp(max=1e4) + \
 					 self.cfg.value_coef * value_loss.clamp(max=1e4)
+					 
+		# Add C-mixup losses if enabled
+		if hasattr(self.cfg, 'use_cmixup') and self.cfg.use_cmixup:
+			if hasattr(self.cfg, 'cmixup_consistency_coef') and self.cfg.cmixup_consistency_coef > 0:
+				total_loss += self.cfg.cmixup_consistency_coef * cmixup_consistency_loss.clamp(max=1e4)
+			
+			if hasattr(self.cfg, 'cmixup_reward_coef') and self.cfg.cmixup_reward_coef > 0:
+				total_loss += self.cfg.cmixup_reward_coef * cmixup_reward_loss.clamp(max=1e4)
+			
+			if hasattr(self.cfg, 'cmixup_value_coef') and self.cfg.cmixup_value_coef > 0:
+				total_loss += self.cfg.cmixup_value_coef * cmixup_value_loss.clamp(max=1e4)
+			
 		weighted_loss = (total_loss.squeeze(1) * weights).mean()
 		weighted_loss.register_hook(lambda grad: grad * (1/self.cfg.horizon))
 		weighted_loss.backward()
@@ -223,10 +345,25 @@ class TDMPC():
 			h.ema(self.model, self.model_target, self.cfg.tau)
 
 		self.model.eval()
-		return {'consistency_loss': float(consistency_loss.mean().item()),
-				'reward_loss': float(reward_loss.mean().item()),
-				'value_loss': float(value_loss.mean().item()),
-				'pi_loss': pi_loss,
-				'total_loss': float(total_loss.mean().item()),
-				'weighted_loss': float(weighted_loss.mean().item()),
-				'grad_norm': float(grad_norm)}
+		metrics = {
+			'consistency_loss': float(consistency_loss.mean().item()),
+			'reward_loss': float(reward_loss.mean().item()),
+			'value_loss': float(value_loss.mean().item()),
+			'pi_loss': pi_loss,
+			'total_loss': float(total_loss.mean().item()),
+			'weighted_loss': float(weighted_loss.mean().item()),
+			'grad_norm': float(grad_norm)
+		}
+		
+		# Add C-mixup losses to metrics if enabled
+		if hasattr(self.cfg, 'use_cmixup') and self.cfg.use_cmixup:
+			if hasattr(self.cfg, 'cmixup_consistency_coef') and self.cfg.cmixup_consistency_coef > 0:
+				metrics['cmixup_consistency_loss'] = float(cmixup_consistency_loss.mean().item())
+			
+			if hasattr(self.cfg, 'cmixup_reward_coef') and self.cfg.cmixup_reward_coef > 0:
+				metrics['cmixup_reward_loss'] = float(cmixup_reward_loss.mean().item())
+			
+			if hasattr(self.cfg, 'cmixup_value_coef') and self.cfg.cmixup_value_coef > 0:
+				metrics['cmixup_value_loss'] = float(cmixup_value_loss.mean().item())
+			
+		return metrics
